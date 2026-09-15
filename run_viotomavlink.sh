@@ -1,6 +1,17 @@
-# start basalt vio and logger concurrently
+#!/bin/bash
+
+# start basalt vio + object tracker and logger concurrently
 # handle cleanup upon exit
 
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Move to the project directory
+cd "$SCRIPT_DIR" || exit 1
+
+# Activate the Python virtual environment
+source "$SCRIPT_DIR/venv/bin/activate" || exit 1
 
 cleanup() {
     echo
@@ -33,14 +44,14 @@ cleanup() {
 
 trap cleanup INT TERM EXIT
 
-python3 basalt_vio.py &
+python3 vio_objtrack.py &
 PID1=$!
 
 python3 vio_to_mavlink.py &
 PID2=$!
 
 echo "[shell] Started:"
-echo "  basalt_vio.py PID=$PID1"
+echo "  vio_objtrack.py PID=$PID1"
 echo "  vio_to_mavlink.py PID=$PID2"
 echo
 echo "Press Ctrl+C once to stop both."
