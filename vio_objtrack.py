@@ -19,6 +19,7 @@ Quit:
 import os
 import struct
 import socket
+import subprocess
 import time
 import signal
 import argparse
@@ -41,6 +42,14 @@ IMU_RATE_HZ = 200
 
 FULL_FRAME_TRACKING = False
 USE_SPATIAL_ASSOCIATION = False
+
+# MediaMTX RTSP target for the annotated tracker frame.
+RTSP_OUT_URL = "rtsp://127.0.0.1:8554/oak_tracker"
+STREAM_PATH = RTSP_OUT_URL.rsplit("/", 1)[-1]
+STREAM_FPS = 20
+
+MEDIAMTX_WEBRTC_PORT = 8889
+MEDIAMTX_HLS_PORT = 8888
 
 running = True
 
@@ -99,6 +108,69 @@ def cleanup_socket(sock):
         pass
 
 
+def get_tailscale_ip():
+    """Return this device's Tailscale IPv4 address, or None if unavailable."""
+    try:
+        out = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True, text=True, timeout=3, check=True
+        )
+        ip = out.stdout.strip().splitlines()[0]
+        return ip or None
+    except Exception:
+        return None
+
+
+def print_web_view_urls():
+    ip = get_tailscale_ip()
+    if ip is None:
+        print("[stream] could not resolve Tailscale IP; is `tailscale` installed/running?")
+        return
+
+    print(f"[stream] view in a browser over Tailscale:")
+    print(f"[stream]   WebRTC (low latency): http://{ip}:{MEDIAMTX_WEBRTC_PORT}/{STREAM_PATH}")
+    print(f"[stream]   HLS (few sec delay):  http://{ip}:{MEDIAMTX_HLS_PORT}/{STREAM_PATH}")
+
+
+def start_ffmpeg_stream(width, height, fps):
+    """Spawn ffmpeg to publish raw BGR frames written to its stdin as RTSP."""
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-probesize", "32",
+        "-analyzeduration", "0",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "-",
+
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-tune", "zerolatency",
+
+        "-crf", "26",
+        "-b:v", "500k",
+        "-maxrate", "500k",
+        "-bufsize", "250k",
+
+        "-g", str(fps),
+        "-keyint_min", str(fps),
+
+        "-x264-params", "slice-max-size=980",
+        "-pkt_size", "1040",
+
+        "-pix_fmt", "yuv420p",
+        "-f", "rtsp",
+        RTSP_OUT_URL,
+    ]
+    print(f"[stream] publishing tracker frames to {RTSP_OUT_URL}")
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    print_web_view_urls()
+    return proc
+
+
 # ----------------------------
 # Main
 # ----------------------------
@@ -117,6 +189,16 @@ def main():
         "--rerun",
         action="store_true",
         help="Enable rerun visualiser"
+    )
+    parser.add_argument(
+        "--display",
+        action="store_true",
+        help="Show the tracker frame in a local cv2 window (requires a DISPLAY)"
+    )
+    parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        help=f"Disable publishing the tracker frame to {RTSP_OUT_URL}"
     )
     args = parser.parse_args()
 
@@ -140,6 +222,9 @@ def main():
     counter = 0
     fps = 0.0
     color = (255, 255, 255)
+
+    ffmpeg_proc = None
+    streaming = not args.no_stream
 
     try:
         with dai.Pipeline() as pipeline:
@@ -499,18 +584,35 @@ def main():
                         color
                     )
 
-                    cv2.imshow("tracker", frame)
+                    if streaming:
+                        if ffmpeg_proc is None:
+                            h, w = frame.shape[:2]
+                            ffmpeg_proc = start_ffmpeg_stream(w, h, STREAM_FPS)
+                        try:
+                            ffmpeg_proc.stdin.write(frame.tobytes())
+                        except BrokenPipeError:
+                            print("[stream] ffmpeg pipe broken, disabling stream")
+                            streaming = False
 
-                key = cv2.waitKey(1)
-                if key == ord("q"):
-                    break
+                    if args.display:
+                        cv2.imshow("tracker", frame)
+
+                if args.display:
+                    key = cv2.waitKey(1)
+                    if key == ord("q"):
+                        break
 
                 if not did_work:
                     time.sleep(0.001)
 
     finally:
         cleanup_socket(sock)
-        cv2.destroyAllWindows()
+        if ffmpeg_proc is not None:
+            if ffmpeg_proc.stdin:
+                ffmpeg_proc.stdin.close()
+            ffmpeg_proc.terminate()
+        if args.display:
+            cv2.destroyAllWindows()
         print("[combined] stopped")
 
 
