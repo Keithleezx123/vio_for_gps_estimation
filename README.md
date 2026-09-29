@@ -79,7 +79,7 @@ N.B. if VIO was run earlier, object tracking will fail because old depthAI pipel
 - Connect host controller UART to flight controller TELEM2 port
 - Configure the relevant Ardupilot parameters as described here https://ardupilot.org/copter/docs/common-vio-tracking-camera.html#hardware-setup
 - Ensure `SERIAL2_OPTIONS = 0`
-- Set `VISO_TYPE = 1` (Mavlink)
+- Set `VISO_TYPE = 2` (IntelT265 handling: aligns VIO frame to compass yaw and handles resets)
 - Open Mission Planner and connect to the flight controller over USB
 - Right click on the map to set EKF origin (VIO 0,0,0) at desired point
 

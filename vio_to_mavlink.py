@@ -98,7 +98,16 @@ raw_roll = raw_pitch = raw_yaw = 0.0
 vision_data_ready = False
 
 
-prev_data = None # Used for jump detection
+prev_data = None # Used for jump detection and velocity estimation
+
+# Jump detection: flag a reset when the step between packets exceeds what the
+# vehicle could physically travel in that time
+max_vehicle_speed = 10.0   # m/s
+jump_pos_margin = 0.1      # m, allowance for VIO noise
+
+# Velocity from position differencing
+min_velocity_dt = 0.02         # s, skip intervals shorter than this
+velocity_filter_alpha = 0.4    # low-pass weight on the newest sample (1 = no filtering)
 
 reset_counter = 1
 
@@ -123,7 +132,8 @@ scale_calib_enable = args.scale_calib_enable
 debug_enable = args.debug_enable or 0
 sock_path = args.socket
 
-H_aeroRef_OAKRef = np.array([[-1,0,0,0],[0,1,0,0],[0,0,-1,0],[0,0,0,1]])
+# Basalt frame: x=right, y=forward, z=up  ->  NED: x=forward(N), y=right(E), z=down(D)
+H_aeroRef_OAKRef = np.array([[0,1,0,0],[1,0,0,0],[0,0,-1,0],[0,0,0,1]])
 H_OAKBody_aeroBody = np.linalg.inv(H_aeroRef_OAKRef)
 
 if debug_enable == 1:
@@ -352,32 +362,38 @@ try:
 
             vision_data_ready = True
 
-            # Calculate GLOBAL XYZ speed
-            V_aeroRef_aeroBody = tf.quaternion_matrix([1,0,0,0])
-            V_aeroRef_aeroBody[0][3] = vx
-            V_aeroRef_aeroBody[1][3] = vy
-            V_aeroRef_aeroBody[2][3] = vz
-            V_aeroRef_aeroBody = H_aeroRef_OAKRef.dot(V_aeroRef_aeroBody)
-
-            # Detect jumps logic
-            curr_data_tuple = (px, py, pz, vx, vy, vz)
-            if prev_data != None:
-                delta_translation = [px - prev_data[0], py - prev_data[1], pz - prev_data[2]]
-                delta_velocity = [vx - prev_data[3], vy - prev_data[4], vz - prev_data[5]]
-                position_displacement = np.linalg.norm(delta_translation)
-                speed_delta = np.linalg.norm(delta_velocity)
-
-                jump_threshold = 0.1 
-                jump_speed_threshold = 20.0 
-                if (position_displacement > jump_threshold) or (speed_delta > jump_speed_threshold):
-                    send_msg_to_gcs('VISO jump detected')
+            # Basalt packet velocity is always zero, so differentiate position instead.
+            # prev_data = (position in Basalt frame, filtered velocity in Basalt frame, host time)
+            now = time.time()
+            curr_pos = np.array([raw_px, raw_py, raw_pz])
+            if prev_data is None:
+                prev_data = (curr_pos, None, now)
+            else:
+                prev_pos, prev_vel, prev_t = prev_data
+                dt = now - prev_t
+                # Packets drained back-to-back give dt ~ 0; wait for a usable interval
+                if dt >= min_velocity_dt:
+                    position_displacement = np.linalg.norm(curr_pos - prev_pos)
+                    jump_threshold = jump_pos_margin + max_vehicle_speed * dt
                     if position_displacement > jump_threshold:
-                        progress("Position jumped by: %s" % position_displacement)
-                    elif speed_delta > jump_speed_threshold:
-                        progress("Speed jumped by: %s" % speed_delta)
-                    increment_reset_counter()
-                
-            prev_data = curr_data_tuple
+                        send_msg_to_gcs('VISO jump detected')
+                        progress("Position jumped by: %s in %.3fs" % (position_displacement, dt))
+                        increment_reset_counter()
+                        # Restart velocity estimate from the post-jump position
+                        V_aeroRef_aeroBody = None
+                        prev_data = (curr_pos, None, now)
+                    else:
+                        vel = (curr_pos - prev_pos) / dt
+                        if prev_vel is not None:
+                            vel = velocity_filter_alpha * vel + (1 - velocity_filter_alpha) * prev_vel
+                        prev_data = (curr_pos, vel, now)
+
+                        # Calculate GLOBAL XYZ speed
+                        V_aeroRef_aeroBody = tf.quaternion_matrix([1,0,0,0])
+                        V_aeroRef_aeroBody[0][3] = vel[0]
+                        V_aeroRef_aeroBody[1][3] = vel[1]
+                        V_aeroRef_aeroBody[2][3] = vel[2]
+                        V_aeroRef_aeroBody = H_aeroRef_OAKRef.dot(V_aeroRef_aeroBody)
 
             if debug_enable == 1:
                 os.system('clear')
