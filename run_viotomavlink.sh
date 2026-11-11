@@ -56,4 +56,4 @@ echo "  vio_to_mavlink.py PID=$PID2"
 echo
 echo "Press Ctrl+C once to stop both."
 
-wait
+wait -n

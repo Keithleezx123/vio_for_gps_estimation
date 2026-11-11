@@ -111,6 +111,11 @@ velocity_filter_alpha = 0.4    # low-pass weight on the newest sample (1 = no fi
 
 reset_counter = 1
 
+# Periodic log of the exact NED pose being sent to the FCU (for bench checks)
+enable_status_log = True
+status_log_period_s = 1.0
+last_status_log_t = 0.0
+
 #######################################
 # Parsing user' inputs
 #######################################
@@ -132,8 +137,13 @@ scale_calib_enable = args.scale_calib_enable
 debug_enable = args.debug_enable or 0
 sock_path = args.socket
 
-# Basalt frame: x=right, y=forward, z=up  ->  NED: x=forward(N), y=right(E), z=down(D)
-H_aeroRef_OAKRef = np.array([[0,1,0,0],[1,0,0,0],[0,0,-1,0],[0,0,0,1]])
+# DepthAI BasaltVIO (depthai-core 3.x, src/basalt/BasaltVIO.cpp) outputs BOTH the
+# world and body frames as FLU (x=forward, y=left, z=up); the RDF optical frame is
+# converted internally. ArduPilot expects world=NED and body=FRD, so both sides
+# need the same flip of y and z. Camera assumed forward-facing and upright
+# (VISO_ORIENT=0). Any constant yaw offset of the Basalt world frame is removed by
+# ArduPilot's yaw alignment with VISO_TYPE=2.
+H_aeroRef_OAKRef = np.array([[1,0,0,0],[0,-1,0,0],[0,0,-1,0],[0,0,0,1]], dtype=float)
 H_OAKBody_aeroBody = np.linalg.inv(H_aeroRef_OAKRef)
 
 if debug_enable == 1:
@@ -164,8 +174,8 @@ def send_vision_position_estimate_message():
             return # Don't send anything until the first packet arrives
 
         # -------- CONSISTENT NED TRANSFORM (position + attitude) --------
-        # H_aeroRef_OAKRef encodes the verified Basalt axes (bas_x=right,
-        # bas_y=forward, bas_z=up). Rebuild the body rotation from the
+        # H_aeroRef_OAKRef maps the DepthAI FLU frames to NED/FRD (see its
+        # definition). Rebuild the body rotation from the
         # already-decomposed Euler angles (exact inverse of euler_from_matrix
         # with the same 'rzyx' convention), attach the raw position as the
         # translation, then conjugate by H_aeroRef_OAKRef so position and
@@ -180,7 +190,14 @@ def send_vision_position_estimate_message():
         X, Y, Z = H_aeroRef_aeroBody[0][3], H_aeroRef_aeroBody[1][3], H_aeroRef_aeroBody[2][3]
         YAW, PITCH, ROLL = tf.euler_from_matrix(H_aeroRef_aeroBody, 'rzyx')
         # ------------------------------------------------------------------
-        
+
+        global last_status_log_t
+        now = time.time()
+        if enable_status_log and now - last_status_log_t >= status_log_period_s:
+            last_status_log_t = now
+            progress("STATUS: NED pos N=%+.2f E=%+.2f D=%+.2f m | roll=%+.1f pitch=%+.1f yaw=%+.1f deg | reset=%d"
+                     % (X, Y, Z, m.degrees(ROLL), m.degrees(PITCH), m.degrees(YAW), reset_counter))
+
         cov_pose = linear_accel_cov * pow(10, 3 - tracker_confidence)
         cov_twist = angular_vel_cov * pow(10, 1 - tracker_confidence)
         covariance = np.array([cov_pose, 0, 0, 0, 0, 0,
